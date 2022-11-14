@@ -3,7 +3,7 @@ extern crate jackal as lib;
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 use flexi_logger::{Duplicate, FileSpec, Logger};
-use lib::{agenda::Agenda, events::Dispatcher, provider::Eventlike};
+use lib::{agenda::Agenda, provider::Eventlike};
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -123,6 +123,36 @@ fn spawn_notify(begin: DateTime<Tz>, event: &dyn Eventlike) {
         .unwrap();
 }
 
+enum ControlFlow {
+    Continue,
+    Restart,
+}
+
+fn wait(
+    events: &std::sync::mpsc::Receiver<lib::events::Event>,
+    until: DateTime<Tz>,
+    info: &str,
+) -> ControlFlow {
+    loop {
+        let until_utc = until.naive_utc();
+        let now = Utc::now().naive_utc();
+        let to_sleep = until_utc - now;
+
+        log::info!("Sleeping {} {}", to_sleep, info);
+
+        match events.recv_timeout(to_sleep.to_std().unwrap_or(std::time::Duration::ZERO)) {
+            Ok(lib::events::Event::ExternalModification) => return ControlFlow::Restart,
+            Ok(lib::events::Event::Update | lib::events::Event::Input(_)) => {
+                panic!("No dispatcher was started so where do those come from?!")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return ControlFlow::Continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("Event senders are disconnected")
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::from_args();
 
@@ -138,44 +168,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = lib::config::load_suitable_config(args.configfile.as_deref())?;
 
-    let _dispatcher = Dispatcher::from_config(&config);
-
-    let calendar = Agenda::from_config(&config)?;
-
+    let (tx, mod_rx) = std::sync::mpsc::channel();
     let headsup_time = Duration::minutes(config.notification_headsup_minutes.into());
     let check_window = Duration::days(1);
     assert!(
         check_window > headsup_time,
         "Check window is too small for headsup time"
     );
-    loop {
-        let begin = Utc::now().naive_utc();
-        let end = begin + check_window;
 
-        let mut next_events = calendar.events_in(begin..end).collect::<Vec<_>>();
-        next_events.sort_unstable_by_key(|(begin, _)| *begin);
+    let mut calendar = Agenda::from_config(&config, &tx)?;
+    'outer: loop {
+        calendar.process_external_modifications();
 
-        for (begin, event) in next_events {
-            let begin_utc = begin.naive_utc();
-            let headsup_begin = begin_utc - headsup_time;
-            let now = Utc::now().naive_utc();
-            let to_sleep = headsup_begin - now;
-            log::info!(
-                "Sleeping {} until headsup time of next event {}",
-                to_sleep,
-                event.summary()
-            );
+        loop {
+            let begin = Utc::now();
+            let end = begin + check_window;
 
-            // Chrono duration may be negative, in which case we do not want to sleep
-            std::thread::sleep(to_sleep.to_std().unwrap_or(std::time::Duration::ZERO));
+            let mut next_events = calendar
+                .events_in(begin.naive_utc()..end.naive_utc())
+                .collect::<Vec<_>>();
+            next_events.sort_unstable_by_key(|(begin, _)| *begin);
 
-            spawn_notify(*begin, event);
+            for (begin, event) in next_events {
+                let headsup_begin = *begin - headsup_time;
+
+                match wait(&mod_rx, headsup_begin, "until headsup time of next event") {
+                    ControlFlow::Restart => continue 'outer,
+                    ControlFlow::Continue => {}
+                }
+
+                spawn_notify(*begin, event);
+            }
+
+            let end = end - headsup_time;
+
+            match wait(
+                &mod_rx,
+                end.with_timezone(&Tz::UTC),
+                " until end of window. No more events!",
+            ) {
+                ControlFlow::Restart => continue 'outer,
+                ControlFlow::Continue => {}
+            }
         }
-
-        let now = Utc::now().naive_utc();
-        let end = end - headsup_time;
-        let to_sleep = end - now;
-        eprintln!("No more events in batch. Sleeping for {}", to_sleep);
-        std::thread::sleep(to_sleep.to_std().unwrap_or(std::time::Duration::ZERO));
     }
 }

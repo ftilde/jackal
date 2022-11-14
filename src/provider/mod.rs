@@ -315,23 +315,25 @@ pub trait Collectionlike {
     fn path(&self) -> &Path;
     fn calendar_iter<'a>(&'a self) -> Box<dyn Iterator<Item = &(dyn Calendarlike + 'a)> + 'a>;
     fn event_iter<'a>(&'a self) -> Box<dyn Iterator<Item = &(dyn Eventlike + 'a)> + 'a>;
+    fn process_external_modifications(&mut self);
     fn new_calendar(&mut self);
 }
 
-pub fn _load_collection(provider: &str, path: &Path) -> Result<impl Collectionlike> {
-    match provider {
-        "ical" => ical::Collection::from_dir(path),
-        _ => Err(Error::new(ErrorKind::CalendarParse, "No collection found")),
-    }
-}
+//pub fn _load_collection(provider: &str, path: &Path) -> Result<impl Collectionlike> {
+//    match provider {
+//        "ical" => ical::Collection::from_dir(path),
+//        _ => Err(Error::new(ErrorKind::CalendarParse, "No collection found")),
+//    }
+//}
 
 pub fn load_collection_with_calendars(
     provider: &str,
     path: &Path,
     calendar_specs: &[CalendarSpec],
+    event_sink: &std::sync::mpsc::Sender<crate::events::Event>,
 ) -> Result<impl Collectionlike> {
     match provider {
-        "ical" => ical::Collection::calendars_from_dir(path, calendar_specs),
+        "ical" => ical::Collection::calendars_from_dir(path, calendar_specs, event_sink),
         _ => Err(Error::new(ErrorKind::CalendarParse, "No collection found")),
     }
 }

@@ -10,13 +10,13 @@ use nom::{
     IResult,
 };
 use rrule::RRule;
-use std::collections::BTreeMap;
 use std::convert::{From, TryFrom};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
+use std::{collections::BTreeMap, sync::mpsc};
 
 use ::ical::parser::ical::IcalParser;
 use ::ical::parser::ical::{component::IcalCalendar, component::IcalEvent};
@@ -359,10 +359,14 @@ impl IcalDateTime {
 
 #[derive(Clone)]
 pub struct Event {
-    _path: PathBuf,
+    path: PathBuf,
     occurrence: Occurrence<Tz>,
     ical: IcalCalendar,
     tz: Tz,
+}
+
+fn uuid_from_path(path: &Path) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(&path.file_stem().unwrap().to_string_lossy().to_string()).ok()
 }
 
 impl Event {
@@ -376,7 +380,7 @@ impl Event {
 
         let uid = if path.is_file() {
             // TODO: Error handling
-            uuid::Uuid::parse_str(&path.file_stem().unwrap().to_string_lossy().to_string()).unwrap()
+            uuid_from_path(path).unwrap()
         } else {
             uuid::Uuid::new_v4()
         };
@@ -413,7 +417,7 @@ impl Event {
         let tz = occurrence.timezone();
 
         Ok(Event {
-            _path: if path.is_file() {
+            path: if path.is_file() {
                 path.to_owned()
             } else {
                 path.join(&uid.to_string()).with_extension(ICAL_FILE_EXT)
@@ -574,7 +578,7 @@ impl Event {
         // TODO: Check for exdate
 
         Ok(Event {
-            _path: path.into(),
+            path: std::fs::canonicalize(path).unwrap_or(path.to_owned()),
             occurrence,
             ical,
             tz,
@@ -620,6 +624,17 @@ impl Event {
 
     pub fn ical_event(&self) -> &IcalEvent {
         &self.ical.events[0]
+    }
+
+    // Note: This is really a "best effort" approach here, since we 1. cannot really assume that
+    // paths contain the uuid and 2. cannot canonicalize, e.g., the path of a deleted file...
+    // We assume here, however, that both paths have been canonicalized.
+    pub fn matches(&self, path: &Path) -> bool {
+        if let Some(path_uuid) = uuid_from_path(path) {
+            self.uuid() == path_uuid
+        } else {
+            self.path == path
+        }
     }
 }
 
@@ -705,35 +720,40 @@ pub struct Calendar {
     friendly_name: String,
     tz: Tz,
     events: BTreeMap<DateTime<Tz>, Vec<Rc<Event>>>,
+    _modification_watcher: notify::RecommendedWatcher,
+    pending_modifications: mpsc::Receiver<ExternalModification>,
 }
 
 impl Calendar {
-    pub fn _new(path: &Path) -> Self {
-        let identifier = uuid::Uuid::new_v4().hyphenated();
-        let friendly_name = identifier.clone();
+    //pub fn _new(path: &Path) -> Self {
+    //    let identifier = uuid::Uuid::new_v4().hyphenated();
+    //    let friendly_name = identifier.clone();
 
-        Self {
-            path: path.to_owned(),
-            _identifier: identifier.to_string(),
-            friendly_name: friendly_name.to_string(),
-            tz: Tz::UTC,
-            events: BTreeMap::new(),
-        }
-    }
+    //    Self {
+    //        path: path.to_owned(),
+    //        _identifier: identifier.to_string(),
+    //        friendly_name: friendly_name.to_string(),
+    //        tz: Tz::UTC,
+    //        events: BTreeMap::new(),
+    //    }
+    //}
 
-    pub fn _new_with_name(path: &Path, name: String) -> Self {
-        let identifier = uuid::Uuid::new_v4().hyphenated();
+    //pub fn _new_with_name(path: &Path, name: String) -> Self {
+    //    let identifier = uuid::Uuid::new_v4().hyphenated();
 
-        Self {
-            path: path.to_owned(),
-            _identifier: identifier.to_string(),
-            friendly_name: name,
-            tz: Tz::UTC,
-            events: BTreeMap::new(),
-        }
-    }
+    //    Self {
+    //        path: path.to_owned(),
+    //        _identifier: identifier.to_string(),
+    //        friendly_name: name,
+    //        tz: Tz::UTC,
+    //        events: BTreeMap::new(),
+    //    }
+    //}
 
-    pub fn from_dir(path: &Path) -> Result<Self> {
+    pub fn from_dir(
+        path: &Path,
+        event_sink: &std::sync::mpsc::Sender<crate::events::Event>,
+    ) -> Result<Self> {
         let mut events = BTreeMap::<DateTime<Tz>, Vec<Rc<Event>>>::new();
 
         if !path.is_dir() {
@@ -778,6 +798,7 @@ impl Calendar {
                 .take_while(|dt| dt <= &(now + Duration::days(356)))
                 .for_each(|dt| events.entry(dt).or_default().push(Rc::clone(&event_rc)));
         }
+        let (watcher, queue) = ical_watcher(path, event_sink.clone());
 
         Ok(Calendar {
             path: path.to_owned(),
@@ -785,6 +806,8 @@ impl Calendar {
             friendly_name: String::default(),
             tz,
             events,
+            _modification_watcher: watcher,
+            pending_modifications: queue,
         })
     }
 
@@ -795,6 +818,48 @@ impl Calendar {
 
     pub fn set_name(&mut self, name: String) {
         self.friendly_name = name;
+    }
+    fn process_external_modifications(&mut self) {
+        fn remove_for_path(events: &mut BTreeMap<DateTime<Tz>, Vec<Rc<Event>>>, path: PathBuf) {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            events.retain(|_, e| {
+                e.retain(|e| !e.matches(&path));
+                !e.is_empty()
+            });
+        }
+        fn add_for_path(
+            events: &mut BTreeMap<DateTime<Tz>, Vec<Rc<Event>>>,
+            tz: &Tz,
+            path: PathBuf,
+        ) {
+            let event = match Event::from_file(&path) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("{}", e);
+                    return;
+                }
+            };
+            let event = Rc::new(event);
+            let now = tz.from_utc_datetime(&Utc::now().naive_utc());
+            event
+                .occurrence()
+                .iter()
+                .skip_while(|dt| dt < &(now - Duration::days(356)))
+                .take_while(|dt| dt <= &(now + Duration::days(356)))
+                .for_each(|dt| events.entry(dt).or_default().push(Rc::clone(&event)));
+        }
+        for m in self.pending_modifications.try_iter() {
+            match m {
+                ExternalModification::Create(path) => {
+                    add_for_path(&mut self.events, &self.tz, path)
+                }
+                ExternalModification::Remove(path) => remove_for_path(&mut self.events, path),
+                ExternalModification::Modify(path) => {
+                    remove_for_path(&mut self.events, path.clone());
+                    add_for_path(&mut self.events, &self.tz, path);
+                }
+            }
+        }
     }
 }
 
@@ -867,7 +932,10 @@ pub struct Collection {
 }
 
 impl Collection {
-    pub fn from_dir(path: &Path) -> Result<Self> {
+    pub fn from_dir(
+        path: &Path,
+        event_sink: &std::sync::mpsc::Sender<crate::events::Event>,
+    ) -> Result<Self> {
         if !path.is_dir() {
             return Err(Error::new(
                 ErrorKind::CalendarParse,
@@ -880,7 +948,7 @@ impl Collection {
                 dir.map_or_else(
                     |_| -> Result<_> { Err(Error::from(io::ErrorKind::InvalidData)) },
                     |file: fs::DirEntry| -> Result<Calendar> {
-                        Calendar::from_dir(file.path().as_path())
+                        Calendar::from_dir(file.path().as_path(), event_sink)
                     },
                 )
             })
@@ -899,7 +967,11 @@ impl Collection {
         })
     }
 
-    pub fn calendars_from_dir(path: &Path, calendar_specs: &[CalendarSpec]) -> Result<Self> {
+    pub fn calendars_from_dir(
+        path: &Path,
+        calendar_specs: &[CalendarSpec],
+        event_sink: &std::sync::mpsc::Sender<crate::events::Event>,
+    ) -> Result<Self> {
         if !path.is_dir() {
             return Err(Error::new(
                 ErrorKind::CalendarParse,
@@ -908,15 +980,17 @@ impl Collection {
         }
 
         if calendar_specs.is_empty() {
-            return Self::from_dir(path);
+            return Self::from_dir(path, event_sink);
         }
 
         let calendars: Vec<Calendar> = calendar_specs
             .into_iter()
-            .filter_map(|spec| match Calendar::from_dir(&path.join(&spec.id)) {
-                Ok(calendar) => Some(calendar.with_name(spec.name.clone())),
-                Err(_) => None,
-            })
+            .filter_map(
+                |spec| match Calendar::from_dir(&path.join(&spec.id), event_sink) {
+                    Ok(calendar) => Some(calendar.with_name(spec.name.clone())),
+                    Err(_) => None,
+                },
+            )
             .collect();
 
         Ok(Collection {
@@ -925,6 +999,80 @@ impl Collection {
             calendars,
         })
     }
+}
+
+#[must_use]
+fn ical_watcher(
+    path: &Path,
+    event_sink: mpsc::Sender<crate::events::Event>,
+) -> (
+    notify::RecommendedWatcher,
+    mpsc::Receiver<ExternalModification>,
+) {
+    use notify::{RecursiveMode, Watcher};
+
+    fn is_ical(path: &Path) -> bool {
+        if let Some(ext) = path.extension() {
+            ext == ICAL_FILE_EXT
+        } else {
+            false
+        }
+    }
+
+    fn relevant_modification(event: notify::Event) -> Option<ExternalModification> {
+        use notify::event::*;
+        match event.kind {
+            EventKind::Create(CreateKind::File) if is_ical(&event.paths[0]) => {
+                Some(ExternalModification::Create(event.paths[0].clone()))
+            }
+            EventKind::Remove(RemoveKind::File)
+            | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+                if is_ical(&event.paths[0]) =>
+            {
+                Some(ExternalModification::Remove(event.paths[0].clone()))
+            }
+            EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                if is_ical(&event.paths[0]) =>
+            {
+                Some(ExternalModification::Modify(event.paths[0].clone()))
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                // TODO: Maybe we want to return both events here.
+                // However, for the specific case of ical we don't really expect a rename (from
+                // ical to ical) because that would imply a changing of uuids!
+                if is_ical(&event.paths[0]) {
+                    Some(ExternalModification::Remove(event.paths[0].clone()))
+                } else if is_ical(&event.paths[1]) {
+                    // It may appear weird that we are emiting "modify" events when something is
+                    // renamed/moved to an .ics file. The reason for this is that we have no
+                    // information about whether the file existed before. Hence we take the safe
+                    // option of (possibly pointlessly) removing old files.
+                    Some(ExternalModification::Modify(event.paths[1].clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    let (queue_writer, queue_reader) = mpsc::channel();
+
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(event) => {
+                if let Some(m) = relevant_modification(event) {
+                    let _ = event_sink.send(crate::events::Event::ExternalModification);
+                    let _ = queue_writer.send(m);
+                }
+            }
+            Err(e) => log::error!("watch error: {:?}", e),
+        })
+        .unwrap();
+
+    watcher.watch(path, RecursiveMode::Recursive).unwrap();
+    (watcher, queue_reader)
 }
 
 impl Collectionlike for Collection {
@@ -944,7 +1092,19 @@ impl Collectionlike for Collection {
         Box::new(self.calendars.iter().flat_map(|c| c.event_iter()))
     }
 
+    fn process_external_modifications(&mut self) {
+        for cal in &mut self.calendars {
+            cal.process_external_modifications()
+        }
+    }
+
     fn new_calendar(&mut self) {
         unimplemented!();
     }
+}
+
+enum ExternalModification {
+    Create(PathBuf),
+    Remove(PathBuf),
+    Modify(PathBuf),
 }

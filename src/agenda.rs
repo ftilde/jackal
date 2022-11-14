@@ -11,7 +11,10 @@ pub struct Agenda {
 }
 
 impl Agenda {
-    pub fn from_config(config: &Config) -> Result<Self> {
+    pub fn from_config(
+        config: &Config,
+        event_sink: &std::sync::mpsc::Sender<crate::events::Event>,
+    ) -> Result<Self> {
         let collections: Vec<Box<dyn Collectionlike>> = config
             .collections
             .iter()
@@ -20,6 +23,7 @@ impl Agenda {
                     &collection_spec.provider,
                     &collection_spec.path,
                     collection_spec.calendars.as_slice(),
+                    &event_sink,
                 )
             })
             .inspect(|c| {
@@ -87,5 +91,11 @@ impl Agenda {
         let today = Utc::today();
 
         self.events_of_day(&today.naive_utc())
+    }
+
+    pub fn process_external_modifications(&mut self) {
+        for c in &mut self.collections {
+            c.process_external_modifications();
+        }
     }
 }
