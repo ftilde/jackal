@@ -4,7 +4,9 @@ use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 use flexi_logger::{Duplicate, FileSpec, Logger};
 use lib::{agenda::Agenda, provider::Eventlike};
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -41,6 +43,7 @@ fn notify(
     begin: DateTime<Tz>,
     end: DateTime<Tz>,
     url: Option<String>,
+    _guard: NotificationGuard,
 ) {
     let mut dismissed = false;
 
@@ -89,8 +92,50 @@ fn notify(
     }
 }
 
-fn spawn_notify(begin: DateTime<Tz>, event: &dyn Eventlike) {
+struct NotificationGuard {
+    map: Arc<Mutex<HashSet<uuid::Uuid>>>,
+    uuid: uuid::Uuid,
+}
+
+impl NotificationGuard {
+    fn new(uuid: uuid::Uuid, map: &Arc<Mutex<HashSet<uuid::Uuid>>>) -> Option<Self> {
+        {
+            let mut r = map.lock().unwrap();
+            if r.contains(&uuid) {
+                return None;
+            }
+            r.insert(uuid);
+        }
+
+        Some(NotificationGuard {
+            map: map.clone(),
+            uuid,
+        })
+    }
+}
+
+impl Drop for NotificationGuard {
+    fn drop(&mut self) {
+        let mut r = self.map.lock().unwrap();
+        r.remove(&self.uuid);
+    }
+}
+
+fn spawn_notify(
+    begin: DateTime<Tz>,
+    event: &dyn Eventlike,
+    running_notifications: &Arc<Mutex<HashSet<uuid::Uuid>>>,
+) {
     use linkify::{LinkFinder, LinkKind};
+    let guard = if let Some(guard) = NotificationGuard::new(event.uuid(), running_notifications) {
+        guard
+    } else {
+        log::info!(
+            "Not rescheduliing running notification for event {}",
+            event.title()
+        );
+        return;
+    };
 
     let end = begin + event.duration();
     let with_dates = begin.date() != end.date();
@@ -119,7 +164,7 @@ fn spawn_notify(begin: DateTime<Tz>, event: &dyn Eventlike) {
 
     let _ = std::thread::Builder::new()
         .name("jackal-notify-notification".to_owned())
-        .spawn(move || notify(title, body, begin, end, url))
+        .spawn(move || notify(title, body, begin, end, url, guard))
         .unwrap();
 }
 
@@ -176,6 +221,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Check window is too small for headsup time"
     );
 
+    let running_notifications = Arc::new(Mutex::new(HashSet::new()));
+
     let mut calendar = Agenda::from_config(&config, &tx)?;
     'outer: loop {
         calendar.process_external_modifications();
@@ -197,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ControlFlow::Continue => {}
                 }
 
-                spawn_notify(*begin, event);
+                spawn_notify(*begin, event, &running_notifications);
             }
 
             let end = end - headsup_time;
