@@ -2,7 +2,8 @@ use chrono::{Datelike, Duration, Month, NaiveDate, NaiveDateTime, TimeZone, Utc}
 use log;
 use num_traits::FromPrimitive;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use std::convert::From;
 use std::ops::{Bound, RangeBounds};
 
 use crate::config::Config;
@@ -14,13 +15,20 @@ use crate::provider::{
     Uid,
 };
 
-#[derive(Default)]
-struct OccurrenceCache {
-    occurrences: BTreeMap<Uid, Vec<TimeSpan<Tz>>>,
-    events: BTreeMap<NaiveDate, HashSet<Uid>>,
+struct OwningCacheLine(Uid, TimeSpan<Tz>);
+
+struct CacheLine<'cache>(&'cache Uid, &'cache TimeSpan<Tz>);
+
+impl<'cache> From<&'cache OwningCacheLine> for CacheLine<'cache> {
+    fn from(value: &'cache OwningCacheLine) -> Self {
+        CacheLine(&value.0, &value.1)
+    }
 }
 
-struct CacheLine<'cache>(&'cache Uid, &'cache [TimeSpan<Tz>]);
+#[derive(Default)]
+struct OccurrenceCache {
+    occurrences: BTreeMap<NaiveDate, Vec<OwningCacheLine>>,
+}
 
 impl OccurrenceCache {
     pub fn add<'occ, I>(&mut self, iter: I)
@@ -28,61 +36,54 @@ impl OccurrenceCache {
         I: IntoIterator<Item = Occurrence<'occ>>,
     {
         for occ in iter {
-            let first_day = occ.begin().date_naive();
-            let last_day = occ.end().date_naive();
+            log::debug!(
+                "Adding occurrence {} - {} of event '{}'",
+                occ.begin().date_naive(),
+                occ.end().date_naive(),
+                occ.event.uid()
+            );
 
-            for day in first_day.iter_days().take_while(|dt| dt <= &last_day) {
-                self.events
-                    .entry(day)
+            for day in occ.days() {
+                log::debug!(
+                    "Adding {} of event '{}'",
+                    day.begin().date_naive(),
+                    occ.event.uid()
+                );
+
+                self.occurrences
+                    .entry(day.begin().date_naive())
                     .or_default()
-                    .insert(occ.event.uid().to_string());
+                    .push(OwningCacheLine(occ.event.uid().to_owned(), day))
             }
-
-            self.occurrences
-                .entry(occ.event.uid().to_string())
-                .or_default()
-                .push(occ.span)
         }
     }
 
     pub fn contains(&self, date: &NaiveDate) -> bool {
-        self.events.contains_key(date)
+        self.occurrences.contains_key(date)
     }
 
     pub fn fetch_range<'cache>(
         &'cache self,
         range: impl RangeBounds<NaiveDate>,
     ) -> impl Iterator<Item = CacheLine<'cache>> + 'cache {
-        let uids = self.events.range(range).flat_map(|(_, uids)| uids.iter());
-
-        uids.into_iter()
-            .map(move |uid| CacheLine(uid, &self.occurrences.get(uid).unwrap()))
+        self.occurrences
+            .range(range)
+            .flat_map(|(_, cls)| cls.iter().map(|cl| cl.into()))
     }
 
     pub fn _fetch<'cache>(
         &'cache self,
         date: &NaiveDate,
     ) -> impl Iterator<Item = CacheLine<'cache>> + 'cache {
-        self.events
+        self.occurrences
             .get(&date)
             .unwrap()
             .iter()
-            .map(move |uid| CacheLine(uid, self.occurrences.get(uid.as_str()).unwrap().as_slice()))
+            .map(|cl| cl.into())
     }
 
     pub fn remove(&mut self, date: &NaiveDate) {
-        let uids = self.events.get(date);
-
-        match uids {
-            Some(uids) => {
-                for uid in uids {
-                    self.occurrences.remove(uid);
-                }
-            }
-            None => (),
-        }
-
-        self.events.remove(date);
+        self.occurrences.remove(date);
     }
 }
 
@@ -140,7 +141,6 @@ impl Agenda {
         &'a self,
         range: impl RangeBounds<NaiveDateTime> + 'a + Clone,
     ) -> Option<impl Iterator<Item = Occurrence<'a>> + 'a> {
-        //impl Iterator<Item = Occurrence<'a>> + 'a {
         let start = match range.start_bound() {
             Bound::Included(t) | Bound::Excluded(t) => Some(t),
             Bound::Unbounded => None,
@@ -156,11 +156,14 @@ impl Agenda {
             let begin_date = start.date();
             let end_date = end.date();
 
+            log::debug!("Fetching date range {} - {}", begin_date, end_date);
+
             for day in begin_date
                 .iter_days()
                 .take_while(|dt| dt <= &end_date)
                 .filter(|dt| !self.occurrence_cache.borrow().contains(dt))
             {
+                log::debug!("Adding date '{}' to cache", day);
                 self.add_to_cache(day);
             }
 
@@ -168,13 +171,13 @@ impl Agenda {
                 .occurrence_cache
                 .borrow()
                 .fetch_range(begin_date..=end_date)
-                .flat_map(move |CacheLine(uid, timespans)| {
+                .map(move |CacheLine(uid, ts)| {
                     let event = self.find_by_uid(uid).unwrap();
 
-                    timespans.into_iter().map(move |ts| Occurrence {
+                    Occurrence {
                         event,
-                        span: ts.clone().with_tz(&Tz::utc()),
-                    })
+                        span: ts.clone(),
+                    }
                 })
                 .collect::<Vec<_>>();
 
@@ -202,6 +205,7 @@ impl Agenda {
         let end = (date + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap();
 
         if cache.contains(&date) {
+            log::debug!("Date '{}' already in cache. Removing.", date);
             cache.remove(&date);
         }
 
